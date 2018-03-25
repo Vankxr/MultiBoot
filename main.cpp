@@ -7,29 +7,6 @@
 
 #include <main.h>
 
-// Default boot config
-boot_cfg_t g_bootConfigDefault = {
-	BOOT_MAGIC,
-	1,
-	BOOT_MODE_NORMAL,
-	BOOT_LOAD_STATUS_OFF,
-	255,
-	0,
-	0,
-	0,
-	1,
-	{
-		0x00100,
-		0x00000,
-		0x00000,
-		0x00000,
-		0x00000
-	},
-	0x00000000,
-	0,
-	0
-};
-
 // Variables
 uint8_t g_ubMCUSR = 0;
 uint8_t g_ubSPIFlashOK = 0;
@@ -44,6 +21,8 @@ void resetMCU()
 
 void calcCRC16(boot_cfg_t* pConfig)
 {
+	pConfig->m_usCRC = 0;
+	
 	for(uint16_t i = 0; i < sizeof(boot_cfg_t) - sizeof(uint16_t); i++)
 		pConfig->m_usCRC = _crc16_update(pConfig->m_usCRC, ((uint8_t*)pConfig)[i]);
 }
@@ -58,23 +37,48 @@ uint8_t validateConfig(boot_cfg_t* pConfig)
 	
 	if(pConfig->m_ubNormalROM >= MAX_ROMS)
 	{
-		DPRINTFLN_CTX("Normal ROM index exceeds MAX_ROMS [%d]", pConfig->m_ubCurrentROM);
+		DPRINTFLN_CTX("Normal ROM index exceeds MAX_ROMS [%u]", pConfig->m_ubCurrentROM);
 		
 		return 0;
 	}
 	
-	if(pConfig->m_ubLoadStatus == BOOT_LOAD_STATUS_ON && pConfig->m_ubLoadROM >= MAX_ROMS)
+	if(pConfig->m_ubNormalROM >= pConfig->m_ubROMCount)
 	{
-		DPRINTFLN_CTX("Load ROM index exceeds MAX_ROMS [%d]", pConfig->m_ubLoadROM);
+		DPRINTFLN_CTX("Normal ROM index exceeds ROMCount [%u] [%u]", pConfig->m_ubLoadROM, pConfig->m_ubROMCount);
 		
 		return 0;
 	}
 	
-	if((pConfig->m_ubMode == BOOT_MODE_PIN || pConfig->m_ubMode == BOOT_MODE_PIN_RESET) && pConfig->m_ubPinROM >= MAX_ROMS)
+	if(pConfig->m_ubLoadStatus == BOOT_LOAD_STATUS_ON)
 	{
-		DPRINTFLN_CTX("Pin ROM index exceeds MAX_ROMS [%d]", pConfig->m_ubPinROM);
-		
-		return 0;
+		if(pConfig->m_ubLoadROM >= MAX_ROMS)
+		{
+			DPRINTFLN_CTX("Load ROM index exceeds MAX_ROMS [%u]", pConfig->m_ubLoadROM);
+			
+			return 0;
+		}
+		else if(pConfig->m_ubLoadROM >= pConfig->m_ubROMCount)
+		{
+			DPRINTFLN_CTX("Load ROM index exceeds ROMCount [%u] [%u]", pConfig->m_ubLoadROM, pConfig->m_ubROMCount);
+			
+			return 0;
+		}
+	}
+	
+	if(pConfig->m_ubMode == BOOT_MODE_PIN || pConfig->m_ubMode == BOOT_MODE_PIN_RESET)
+	{
+		if(pConfig->m_ubPinROM >= MAX_ROMS)
+		{
+			DPRINTFLN_CTX("Pin ROM index exceeds MAX_ROMS [%u]", pConfig->m_ubPinROM);
+			
+			return 0;
+		}
+		else if(pConfig->m_ubPinROM >= pConfig->m_ubROMCount)
+		{
+			DPRINTFLN_CTX("Pin ROM index exceeds ROMCount [%u] [%u]", pConfig->m_ubPinROM, pConfig->m_ubROMCount);
+			
+			return 0;
+		}
 	}
 	
 	uint16_t crc = 0;
@@ -84,7 +88,7 @@ uint8_t validateConfig(boot_cfg_t* pConfig)
 	
 	if(crc)
 	{
-		DPRINTFLN_CTX("CRC does not match [%02X]", crc);
+		DPRINTFLN_CTX("CRC does not match [0x%04X]", crc);
 		
 		return 0;
 	}
@@ -128,14 +132,14 @@ uint8_t bootROM(uint32_t ulAddress)
 {
 	if(ulAddress < (((_VECTORS_SIZE / SPM_PAGESIZE) * SPM_PAGESIZE) + SPM_PAGESIZE)) // The (original) page-boundary IVT space is required to be volatile (i.e. each firmware must have its own IVT copy, never flash to 0x00000)
 	{
-		DPRINTFLN_CTX("Address is lower than IVT size [0x%04X]", ulAddress);
+		DPRINTFLN_CTX("Address is lower than IVT size [0x%08X]", ulAddress);
 		
 		return 0;
 	}
 		
 	if(ulAddress + _VECTORS_SIZE > FLASHEND)
 	{
-		DPRINTFLN_CTX("Data size exceeds flash size [0x%04X]", ulAddress);
+		DPRINTFLN_CTX("Data size exceeds flash size [0x%08X]", ulAddress);
 		
 		return 0;
 	}
@@ -147,28 +151,30 @@ uint8_t bootROM(uint32_t ulAddress)
 	
 	memset(ivtBuf, 0, _VECTORS_SIZE); // Probably not needed
 	
+	DPRINTFLN_CTX("Loading IVT into internal buffer [0x%08X] [%u]", ulAddress, _VECTORS_SIZE);
+	
 	// Load the IVT from the desired address
 	if(ulAddress > 0xFFFF) // If the address is larger than 2 bytes we need a ELPM instead of a LPM
 		memcpy_PF(ivtBuf, ulAddress, _VECTORS_SIZE);
 	else
 		memcpy_P(ivtBuf, (void*)ulAddress, _VECTORS_SIZE);
 		
-	DPRINTFLN_CTX("IVT Loaded into internal buffer [0x%04X] [%u]", ulAddress, _VECTORS_SIZE);
+	DPRINTFLN_CTX("IVT Loaded into internal buffer");
 	
 	for(uint16_t i = 0; i < _VECTORS_SIZE; i += 4) // Each vector is 4 bytes in size (2 words)
 	{
 		uint32_t op = ((uint32_t)ivtBuf[i] << 24) | ((uint32_t)ivtBuf[i + 1] << 16) | ((uint32_t)ivtBuf[i + 2] << 8) | ivtBuf[i + 3];
 
-		DPRINTFLN_CTX("Original bytecode [%02X] [%02X] [%02X] [%02X]", ivtBuf[i], ivtBuf[i + 1], ivtBuf[i + 2], ivtBuf[i + 3]);
+		DPRINTFLN_CTX("Original bytecode [%02X %02X %02X %02X]", ivtBuf[i], ivtBuf[i + 1], ivtBuf[i + 2], ivtBuf[i + 3]);
 
 		op >>= 16; // Lower byte would be masked anyways, so discard it
 		op &= 0x00F0; // Mask the offset and leave only the OP code
 
-		DPRINTFLN_CTX("OP code at vector [0x%04X] [%u]", op, i / 4);
+		DPRINTFLN_CTX("OP code at vector [0x%04X] [%u]", op, (uint16_t)(i / 4));
 
 		if(op == 0x00C0) // RJMP OP code
 		{
-			DPRINTFLN_CTX("Found RJMP at vector [%u]", i / 4);
+			DPRINTFLN_CTX("Found RJMP at vector [%u]", (uint16_t)(i / 4));
 			
 			uint32_t destAddr = 0; // Destination (byte) address
 			int16_t diffAddr = 0; // Difference (word) address
@@ -181,7 +187,7 @@ uint8_t bootROM(uint32_t ulAddress)
 			diffAddr |= (diffAddr & 0x0800) << 3;
 			diffAddr |= (diffAddr & 0x0800) << 4;
 
-			DPRINTFLN_CTX("RJMP diff byte address [0x%04X]", diffAddr * 2);
+			DPRINTFLN_CTX("RJMP diff byte address [%d]", diffAddr * 2);
 
 			destAddr = ulAddress + i + 2 + diffAddr * 2; // "RJMP k" = "PC <- (k + 1)" (k is in words)
 			
@@ -194,7 +200,7 @@ uint8_t bootROM(uint32_t ulAddress)
 			ivtBuf[i + 2] = (destAddr & 0x0001FE) >> 1;
 			ivtBuf[i + 3] = (destAddr & 0x01FE00) >> 9;
 			
-			DPRINTFLN_CTX("Patched bytecode [%02X] [%02X] [%02X] [%02X]", ivtBuf[i], ivtBuf[i + 1], ivtBuf[i + 2], ivtBuf[i + 3]);
+			DPRINTFLN_CTX("Patched bytecode [%02X %02X %02X %02X]", ivtBuf[i], ivtBuf[i + 1], ivtBuf[i + 2], ivtBuf[i + 3]);
 		}
 		
 		if((i / SPM_PAGESIZE) > pageIndex) // If we have already modified one flash page, write it and increment the counter
@@ -308,11 +314,32 @@ int main()
 		resetMCU();
 	}
 	
-	DPRINTFLN_CTX("Current ROM [%d]", bootConfig.m_ubCurrentROM);
+	DPRINTFLN_CTX("Boot config valid!");
+	
+	DPRINTFLN_CTX("  Magic: 0x%02X!", bootConfig.m_ubMagic);
+	DPRINTFLN_CTX("  Version: 0x%02X!", bootConfig.m_ubVersion);
+	DPRINTFLN_CTX("  Mode: %u!", bootConfig.m_ubMode);
+	DPRINTFLN_CTX("  Load Status: %u!", bootConfig.m_ubLoadStatus);
+	DPRINTFLN_CTX("  Current ROM: %u!", bootConfig.m_ubCurrentROM);
+	DPRINTFLN_CTX("  Normal ROM: %u!", bootConfig.m_ubNormalROM);
+	DPRINTFLN_CTX("  Pin ROM: %u!", bootConfig.m_ubPinROM);
+	DPRINTFLN_CTX("  Load ROM: %u!", bootConfig.m_ubLoadROM);
+	DPRINTFLN_CTX("  ROM Count: %u!", bootConfig.m_ubROMCount);
+	
+	for(uint8_t i = 0; i < bootConfig.m_ubROMCount; i++)
+		DPRINTFLN_CTX("  ROM #%u Address: 0x%08X!", i, bootConfig.m_ulROMAddress[i]);
+	
+	DPRINTFLN_CTX("  Load ROM External Flash Address: 0x%08X!", bootConfig.m_ulLoadROMFlashAddress);
+	DPRINTFLN_CTX("  Load ROM Size: %lu!", bootConfig.m_ulLoadROMSize);
+	DPRINTFLN_CTX("  CRC16: 0x%04X!", bootConfig.m_usCRC);
+	
+	uint8_t resetNeeded = 0;
 	
 	if(bootConfig.m_ubLoadStatus == BOOT_LOAD_STATUS_ON)
 	{
-		DPRINTFLN_CTX("Going to load ROM [%d]", bootConfig.m_ubLoadROM);
+		DPRINTFLN_CTX("Going to load ROM [%u]", bootConfig.m_ubLoadROM);
+		
+		resetNeeded = 1;
 		
 		if(loadROM(bootConfig.m_ulROMAddress[bootConfig.m_ubLoadROM], bootConfig.m_ulLoadROMFlashAddress, bootConfig.m_ulLoadROMSize))
 			bootConfig.m_ubLoadStatus = BOOT_LOAD_STATUS_OFF;
@@ -320,7 +347,9 @@ int main()
 	
 	if(bootConfig.m_ubMode == BOOT_MODE_NORMAL && bootConfig.m_ubNormalROM != bootConfig.m_ubCurrentROM)
 	{
-		DPRINTFLN_CTX("Going to boot ROM [%d]", bootConfig.m_ubNormalROM);
+		DPRINTFLN_CTX("Going to boot ROM [%u]", bootConfig.m_ubNormalROM);
+		
+		resetNeeded = 1;
 		
 		if(bootROM(bootConfig.m_ulROMAddress[bootConfig.m_ubNormalROM]))
 			bootConfig.m_ubCurrentROM = bootConfig.m_ubNormalROM;
@@ -328,8 +357,17 @@ int main()
 	
 	calcCRC16(&bootConfig);
 	
+	DPRINTFLN_CTX("Updating boot config");
 	eeprom_busy_wait();
 	eeprom_update_block(&bootConfig, BOOT_CONFIG_EE_ADDRESS, sizeof(boot_cfg_t));
+	
+	if(resetNeeded)
+	{
+		DPRINTFLN_CTX("Resetting the system to clear registers");
+		resetMCU();
+	}
+	
+	DPRINTFLN_CTX("Booting the application");
 	
 	/*	
 	if(g_ubMCUSR & ((1 << EXTRF) | (1 << PORF))) // External & POR Reset
